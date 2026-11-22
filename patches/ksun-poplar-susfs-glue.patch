@@ -1,0 +1,296 @@
+diff --git a/kernel/Kbuild b/kernel/Kbuild
+index ca452f28..385f327d 100644
+--- a/kernel/Kbuild
++++ b/kernel/Kbuild
+@@ -44,4 +44,5 @@ kernelsu-objs += supercall/compat.o
+ kernelsu-objs += feature/adb_root.o
+ kernelsu-objs += feature/selinux_hide.o
++kernelsu-$(CONFIG_KSU_SUSFS) += feature/susfs_glue.o
+ 
+ ifdef KBUILD_EXTMOD
+diff --git a/kernel/Kconfig b/kernel/Kconfig
+index 946966dc..1e821798 100644
+--- a/kernel/Kconfig
++++ b/kernel/Kconfig
+@@ -73,3 +73,70 @@ config KSU_SYSCALL_TABLE_HOOK
+ endchoice
+ 
++config KSU_SUSFS
++	bool "KernelSU addon - SUSFS (fs/susfs.c kernel core)"
++	depends on KSU && KSU != m
++	depends on THREAD_INFO_IN_TASK
++	default n
++	help
++	  Wire the in-tree SUSFS core (fs/susfs.c, include/linux/susfs.h) to
++	  KernelSU-Next: reboot-syscall command dispatch, susfs_init(),
++	  susfs_is_current_ksu_domain() and the post-umount work item.
++	  The kernel core itself must already be in the tree.
++
++config KSU_SUSFS_SUS_PATH
++	bool "SUSFS sus_path (userspace commands only unless the kernel has call sites)"
++	depends on KSU_SUSFS
++	default n
++
++config KSU_SUSFS_SUS_MOUNT
++	bool "SUSFS sus_mount (fs/namespace.c hunks)"
++	depends on KSU_SUSFS
++	default n
++
++config KSU_SUSFS_SUS_KSTAT
++	bool "SUSFS sus_kstat"
++	depends on KSU_SUSFS
++	default n
++
++config KSU_SUSFS_TRY_UMOUNT
++	bool "SUSFS try_umount (alias of KernelSU-Next kernel_umount in this port)"
++	depends on KSU_SUSFS
++	default n
++	help
++	  SUSFS v2.3.0 has no separate try_umount list in the kernel core
++	  (CMD_SUSFS_ADD_TRY_UMOUNT is deprecated). This option routes the
++	  setresuid umount through susfs_try_umount(), which calls the
++	  KernelSU-Next ksu_handle_umount() unchanged.
++
++config KSU_SUSFS_SPOOF_UNAME
++	bool "SUSFS spoof_uname"
++	depends on KSU_SUSFS
++	default n
++
++config KSU_SUSFS_ENABLE_LOG
++	bool "SUSFS kernel logging"
++	depends on KSU_SUSFS
++	default n
++
++config KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
++	bool "SUSFS kallsyms symbol hiding (no kernel implementation in this port)"
++	depends on KSU_SUSFS
++	default n
++
++config KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
++	bool "SUSFS spoof /proc/cmdline"
++	depends on KSU_SUSFS
++	default n
++
++config KSU_SUSFS_OPEN_REDIRECT
++	bool "SUSFS open_redirect"
++	depends on KSU_SUSFS
++	default n
++
++config KSU_SUSFS_SUS_MAP
++	bool "SUSFS sus_map"
++	depends on KSU_SUSFS
++	default n
++
++
+ endmenu
+diff --git a/kernel/core/init.c b/kernel/core/init.c
+index 9be09872..0de48efd 100644
+--- a/kernel/core/init.c
++++ b/kernel/core/init.c
+@@ -1,2 +1,5 @@
++#ifdef CONFIG_KSU_SUSFS
++#include <linux/susfs.h>
++#endif
+ #include <linux/export.h>
+ #include <linux/fs.h>
+@@ -136,4 +139,8 @@ int __init kernelsu_init(void)
+ 	ksu_feature_init();
+ 
++#ifdef CONFIG_KSU_SUSFS
++	susfs_init();
++#endif
++
+ 	ksu_sulog_init();
+ 
+diff --git a/kernel/feature/susfs_glue.c b/kernel/feature/susfs_glue.c
+new file mode 100644
+index 00000000..19e5c80a
+--- /dev/null
++++ b/kernel/feature/susfs_glue.c
+@@ -0,0 +1,112 @@
++// KernelSU-Next <-> in-tree SUSFS core (fs/susfs.c, SUSFS v2.3.0 NON-GKI 4.4 port) glue.
++// Only what fs/susfs.c does not provide itself is here: the command dispatch, the KSU-domain predicate it
++// calls, the try_umount entry and the deferred sus_path work. No kernel hook sites are added by this file.
++#include <linux/cred.h>
++#include <linux/sched.h>
++#include <linux/types.h>
++#include <linux/uaccess.h>
++#include <linux/workqueue.h>
++#include <linux/susfs.h>
++#include <linux/susfs_def.h>
++
++#include "klog.h" // IWYU pragma: keep
++#include "ksu.h"
++#include "selinux/selinux.h"
++#include "policy/allowlist.h"
++#include "feature/kernel_umount.h"
++#include "feature/susfs_glue.h"
++
++/* referenced by fs/susfs.c */
++bool susfs_is_current_ksu_domain(void)
++{
++	return is_ksu_domain();
++}
++
++#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
++void susfs_try_umount(uid_t old_uid, uid_t new_uid)
++{
++	ksu_handle_umount(old_uid, new_uid);
++}
++#endif
++
++#ifdef CONFIG_KSU_SUSFS_SUS_PATH
++/* defined in fs/susfs.c; its handler runs susfs_run_sus_path_loop() under ksu_cred */
++extern struct work_struct susfs_extra_works;
++#endif
++
++void susfs_after_umount(uid_t new_uid)
++{
++#ifdef CONFIG_KSU_SUSFS_SUS_PATH
++	/* same gating idea as the kernel umount: zygote child that became an app uid */
++	if (is_appuid(new_uid) && is_zygote(current_cred()))
++		schedule_work(&susfs_extra_works);
++#endif
++}
++
++void susfs_dispatch(unsigned int cmd, void __user **arg)
++{
++	switch (cmd) {
++#ifdef CONFIG_KSU_SUSFS_SUS_PATH
++	case CMD_SUSFS_ADD_SUS_PATH:
++		susfs_add_sus_path(arg);
++		break;
++	case CMD_SUSFS_ADD_SUS_PATH_LOOP:
++		susfs_add_sus_path_loop(arg);
++		break;
++#endif
++#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
++	case CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS:
++		susfs_set_hide_sus_mnts_for_non_su_procs(arg);
++		break;
++#endif
++#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
++	case CMD_SUSFS_ADD_SUS_KSTAT:
++	case CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY: /* same handler; st_susfs_sus_kstat.is_statically selects the mode */
++		susfs_add_sus_kstat(arg);
++		break;
++	case CMD_SUSFS_UPDATE_SUS_KSTAT:
++		susfs_update_sus_kstat(arg);
++		break;
++#endif
++#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
++	case CMD_SUSFS_SET_UNAME:
++		susfs_set_uname(arg);
++		break;
++#endif
++#ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
++	case CMD_SUSFS_ENABLE_LOG:
++		susfs_enable_log(arg);
++		break;
++#endif
++#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
++	case CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG:
++		susfs_set_cmdline_or_bootconfig(arg);
++		break;
++#endif
++#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
++	case CMD_SUSFS_ADD_OPEN_REDIRECT:
++		susfs_add_open_redirect(arg);
++		break;
++#endif
++#ifdef CONFIG_KSU_SUSFS_SUS_MAP
++	case CMD_SUSFS_ADD_SUS_MAP:
++		susfs_add_sus_map(arg);
++		break;
++#endif
++	case CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING:
++		susfs_set_avc_log_spoofing(arg);
++		break;
++	case CMD_SUSFS_SHOW_VERSION:
++		susfs_show_version(arg);
++		break;
++	case CMD_SUSFS_SHOW_ENABLED_FEATURES:
++		susfs_get_enabled_features(arg);
++		break;
++	case CMD_SUSFS_SHOW_VARIANT:
++		susfs_show_variant(arg);
++		break;
++	default:
++		/* deprecated / unknown commands (ADD_SUS_MOUNT, ADD_TRY_UMOUNT, SUS_SU, ...): ignored */
++		break;
++	}
++}
+diff --git a/kernel/feature/susfs_glue.h b/kernel/feature/susfs_glue.h
+new file mode 100644
+index 00000000..5ec4c03f
+--- /dev/null
++++ b/kernel/feature/susfs_glue.h
+@@ -0,0 +1,19 @@
++#ifndef __KSU_H_SUSFS_GLUE
++#define __KSU_H_SUSFS_GLUE
++
++#include <linux/types.h>
++#include <linux/compiler.h>
++
++#ifdef CONFIG_KSU_SUSFS
++/* reboot(2) extension: magic1 == KSU_INSTALL_MAGIC1, magic2 == SUSFS_MAGIC; caller has checked uid == 0 */
++void susfs_dispatch(unsigned int cmd, void __user **arg);
++/* called from ksu_handle_setresuid() right after the kernel umount was queued */
++void susfs_after_umount(uid_t new_uid);
++#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
++void susfs_try_umount(uid_t old_uid, uid_t new_uid);
++#endif
++#else
++static inline void susfs_after_umount(uid_t new_uid) { }
++#endif
++
++#endif
+diff --git a/kernel/hook/setuid_hook.c b/kernel/hook/setuid_hook.c
+index b430329e..def34d63 100644
+--- a/kernel/hook/setuid_hook.c
++++ b/kernel/hook/setuid_hook.c
+@@ -27,4 +27,5 @@
+ #include "compat/kernel_compat.h"
+ #include "supercall/compat.h"
++#include "feature/susfs_glue.h"
+ 
+ int ksu_handle_setresuid(uid_t old_uid, uid_t new_uid)
+@@ -73,5 +74,10 @@ int ksu_handle_setresuid(uid_t old_uid, uid_t new_uid)
+ 
+     // Handle kernel umount
++#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
++    susfs_try_umount(old_uid, new_uid);
++#else
+     ksu_handle_umount(old_uid, new_uid);
++#endif
++    susfs_after_umount(new_uid);
+ 
+     return 0;
+diff --git a/kernel/supercall/supercall.c b/kernel/supercall/supercall.c
+index 9c7ac7bb..b8e727f6 100644
+--- a/kernel/supercall/supercall.c
++++ b/kernel/supercall/supercall.c
+@@ -22,4 +22,8 @@
+ 
+ #include "sulog/event.h"
++#ifdef CONFIG_KSU_SUSFS
++#include <linux/susfs_def.h>
++#include "feature/susfs_glue.h"
++#endif
+ 
+ uint32_t ksuver_override = 0;
+@@ -160,4 +164,14 @@ int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
+ 	}
+ 
++#ifdef CONFIG_KSU_SUSFS
++	if (magic2 == SUSFS_MAGIC) {
++		// only root is allowed for SUSFS commands (same rule as the other extensions)
++		if (current_uid().val != 0)
++			return 0;
++		susfs_dispatch(cmd, arg);
++		return 0;
++	}
++#endif
++
+ 	// extensions 
+ 	u64 reply = (u64)*arg;
